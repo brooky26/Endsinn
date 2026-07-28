@@ -1,8 +1,0 @@
-[phases.setup]
-nixPkgs = ["python312", "python312Packages.pip", "gcc"]
-
-[phases.install]
-cmds = ["python -m pip install --no-cache-dir -r requirements.txt"]
-
-[start]
-cmd = "python expiryrange_bot_v3_1hz10v.py"
