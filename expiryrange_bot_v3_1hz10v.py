@@ -146,7 +146,15 @@ BASE_STAKE        = 0.35     # Deriv minimum (was mistakenly 1.0 -- see v3 notes
                               # "~0.658" comment only checks out at 0.35, so
                               # this corrects a pre-existing inconsistency,
                               # not just a v3 preference)
-MIN_NET_PAYOUT    = 0.182     # 52% of $0.35 — enforced via proposal API
+MIN_NET_PAYOUT    = 0.11      # v6 (2026-07-29): was 0.182 (52% of $0.35).
+                               # User-specified correction: minimum payout
+                               # per $0.35 stake should be $0.11 (~31%), not
+                               # $0.182. Reference value only now (see
+                               # MC_FAIR_ODDS_CEIL below and rank_candidates_
+                               # by_ev's edge_frac gating) -- not a hard
+                               # floor by itself, but BARRIER_SIGMAS below is
+                               # now calibrated so real Deriv payouts land
+                               # around this figure instead of $0.01-0.04.
 WATCHDOG_TIMEOUT  = 15 * 60  # 15 min — accounts for GARCH + bootstrap time
 HISTORY_BOOTSTRAP = 5000
 MIN_TICKS_FOR_FIT = 200
@@ -155,9 +163,9 @@ GARCH_SCALE       = 1000.0   # scale factor for GARCH fitting on relative return
 
 # ── Martingale staking (per-symbol, independent streak tracking) ──────────
 MG_ENABLED        = True
-MG_TRIGGER_LOSSES = 1      # only escalate after this many CONSECUTIVE losses
+MG_TRIGGER_LOSSES = 2      # only escalate after this many CONSECUTIVE losses
 MG_MAX_STEPS      = 3      # cap — step 4 onward stays at step-3 stake
-MG_FACTOR         = 1.35
+MG_FACTOR         = 1.18
 MG_MAX_STAKE      = BASE_STAKE * (MG_FACTOR ** MG_MAX_STEPS) * 1.05  # hard ceiling
                                                                        # (safety margin
                                                                        # for rounding)
@@ -188,8 +196,8 @@ STAKE_MULT_MAX    = 1.75   # cap on edge-driven upsizing (separate from and
                             # multiplicative with martingale recovery scaling)
 
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 1      # consecutive passes the top candidate must survive
-CONFIRM_MIN_GAP_SECS  = 40     # minimum time between confirmation checks
+CONFIRM_REQUIRED      = 2      # consecutive passes the top candidate must survive
+CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
 CONFIRM_DUR_TOLERANCE = 60     # candidate is "the same" signal if its duration
@@ -226,7 +234,33 @@ DURATION_CANDIDATES = list(range(60, 481, 30))   # 60,90,...,480 (15 values)
 # of the old hand-picked list) across the same overall range, plus extending
 # down to 0.30 now that the win_prob ceiling isn't artificially truncating
 # the useful zone.
-BARRIER_SIGMAS = [round(0.30 + 0.05 * i, 2) for i in range(35)]   # 0.30..2.00
+# v6 (2026-07-29): re-centered based on real log data + explicit user
+# calibration. The 2026-07-29 log showed EV ranking consistently selecting
+# the WIDEST sigmas in the old 0.30-2.00 grid (1.35-2.00 observed) because
+# those have the highest win_prob and win_prob drives weighted_score/
+# candidate ranking before live pricing is known -- but Deriv's real payout
+# at those widths was $0.01-0.04 on a $0.35 stake (some even "offers no
+# return"), giving strongly negative edge_frac every time (down to -0.078).
+# The barriers were too safe/wide to be worth trading, and the ranking logic
+# was actively steering toward exactly that failure mode.
+#
+# User-specified fix: absolute barrier should be +-1.69 to +-2.30 (price
+# units) at the 2-minute (120s) duration. Converting via that cycle's own
+# logged abs_vol_per_tick (0.16998, GARCH): vol_terminal(120s) =
+# 0.16998 * sqrt(120) = 1.862, so target sigma = barrier_abs / vol_terminal
+# = 1.69/1.862 .. 2.30/1.862 = 0.91 .. 1.24. Since sigma is ALREADY defined
+# relative to vol_terminal (which itself scales as sqrt(duration)), this
+# same sigma window is the best available generalization to every other
+# duration in DURATION_CANDIDATES too -- vol_terminal does the duration
+# scaling automatically, sigma is what stays constant across durations for
+# a given "how strict" setting.
+#
+# Grid: 0.85-1.35 (mild padding either side of the 0.91-1.24 target so EV
+# ranking still has real candidates to compare, not a single point) in 0.025
+# steps -- finer granularity than the old grid despite covering under a
+# third of its range, so this isn't a step backward on "widen the
+# opportunity set" from the earlier fix, just correctly relocated.
+BARRIER_SIGMAS = [round(0.85 + 0.025 * i, 3) for i in range(21)]   # 0.85..1.35
 BARRIER_ABS_MIN = 0.3    # minimum absolute barrier (price units)
 
 # ── Asymmetric barrier config ─────────────────────────────────────────────
