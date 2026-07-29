@@ -262,13 +262,29 @@ DIR_OVERLAY_MIN_PAYOUT = 0.05              # lower payout floor for CALL/PUT
 SYMBOL_CONFIG = {
     "1HZ10V": {
         "ticks_per_sec":     1.0,
-        "max_adx":           8,     # was 22 — never fired; observed live range was
-                                     # 5.1-9.2 (mean 7.1). 9 sits just above the 75th
-                                     # percentile (7.68) so it filters genuine trend
-                                     # spikes without blocking normal conditions.
+        "max_adx":           10,    # v5 (2026-07-28 log): was 8, but that's not what
+                                     # the old comment even claimed (it said "9" was
+                                     # the calibrated value -- 8 shipped by mistake).
+                                     # Real log data over a 4-min live window showed
+                                     # ADX=8.0-9.6, mean 8.7, i.e. current conditions
+                                     # sit AT the old threshold -- it was blocking
+                                     # ~80% of all cycles (66/83 blocked gate checks
+                                     # cited fail_adx alone). Set to 10, comfortably
+                                     # above the observed 9.6 max, so it filters
+                                     # genuine trend spikes again instead of blocking
+                                     # ordinary conditions. Re-check against a longer
+                                     # log once this has run a full session -- 4
+                                     # minutes of data is enough to see the threshold
+                                     # was clearly miscalibrated, not enough to
+                                     # perfectly recalibrate it.
         "min_vol_trust":     0.85,
-        "max_mbs":           0.40,
-        "boll_width_factor": 1.20,
+        "max_mbs":           0.50,  # v5: was 0.40; observed failing values were
+                                     # 0.45-0.49, same "threshold sits inside the
+                                     # normal range" symptom as max_adx above.
+        "boll_width_factor": 1.20,  # NOT changed -- observed fail_boll values
+                                     # (cur_std/med_std up to 2.15) look like genuine
+                                     # volatility expansion, not miscalibration; this
+                                     # gate was doing its job in the log.
         "max_hawkes":        0.50,
         "cooldown_secs":     150,
         "barrier_dp":        2,    # Deriv: max 2 decimal places for 1HZ10V barriers
