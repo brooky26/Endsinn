@@ -137,7 +137,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 # ── Symbols ───────────────────────────────────────────────────────────────
 # v3: restricted to 1HZ10V only (RDBEAR dropped) -- see header notes.
-SYMBOLS = ["1HZ10V"]
+SYMBOLS = ["1HZ10V" "R_10"]
 
 # ── Contract parameters ───────────────────────────────────────────────────
 BASE_STAKE        = 0.35     # Deriv minimum (was mistakenly 1.0 -- see v3 notes
@@ -165,7 +165,7 @@ GARCH_SCALE       = 1000.0   # scale factor for GARCH fitting on relative return
 MG_ENABLED        = True
 MG_TRIGGER_LOSSES = 1      # only escalate after this many CONSECUTIVE losses
 MG_MAX_STEPS      = 3      # cap — step 4 onward stays at step-3 stake
-MG_FACTOR         = 1.7
+MG_FACTOR         = 1.18
 MG_MAX_STAKE      = BASE_STAKE * (MG_FACTOR ** MG_MAX_STEPS) * 1.05  # hard ceiling
                                                                        # (safety margin
                                                                        # for rounding)
