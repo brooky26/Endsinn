@@ -215,8 +215,8 @@ MC_CI_PERCENTILE = 5
 # obviously a coin flip (win_prob too low) or obviously unpriceable
 # ("no return" territory, win_prob too high). See MC_FAIR_ODDS_CEIL below
 # for where the old tight ceiling came from.
-MC_REQUIRED_WIN  = 0.50
-MC_REQUIRED_CI   = 0.46
+MC_REQUIRED_WIN  = 0.57
+MC_REQUIRED_CI   = 0.50
 MC_FAIR_ODDS_CEIL = BASE_STAKE / (BASE_STAKE + MIN_NET_PAYOUT)   # ~ 0.658 --
                                                  # kept only as a reference
                                                  # point / log annotation now.
