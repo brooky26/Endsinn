@@ -1644,25 +1644,36 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
 
                 # Payout-awareness penalty. EXPIRYRANGE payout falls roughly
                 # as win_prob rises (wider/safer window = smaller return,
-                # before house margin payout ~ stake/win_prob). Above ~0.92
-                # win_prob, Deriv frequently refuses to quote at all
-                # ("This contract offers no return.") — this was discovered
-                # live: sorting purely on weighted_score = wp*dw*bw pushed
-                # every confirmed candidate to barrier_sigma=2.00 (the grid
-                # maximum) with win_prob~0.98-0.99, and 100% of those got
-                # rejected by the proposal API. implied_payout_mult is a
-                # cheap proxy (no extra API calls) for whether a candidate
-                # is likely to clear Deriv's own payout floor.
-                implied_payout_mult = 1.0 / max(wp, 1e-6)
-                if wp > 0.92:
-                    # Steeply discount candidates in the "no return" danger
-                    # zone so they fall behind genuinely tradeable ones,
-                    # without hard-excluding them (still allowed if nothing
-                    # else clears the gates).
-                    payout_penalty = 1.0 - 3.0 * (wp - 0.92)
-                    payout_penalty = max(payout_penalty, 0.05)
-                else:
-                    payout_penalty = 1.0
+                # before house margin payout ~ stake/win_prob).
+                #
+                # v7 BUG FIX (2026-07-29): the previous version only started
+                # discounting above wp=0.92 -- but MC_MAX_WIN_PROB was
+                # loosened to 0.90 in an earlier fix (moving the real
+                # accept/reject decision to live proposal EV instead of this
+                # analytical ceiling). That made the 0.92 knee UNREACHABLE:
+                # every candidate this optimizer can even generate now has
+                # wp <= 0.90, so payout_penalty was silently 1.0 for 100% of
+                # candidates, every cycle. With no counterweight, raw wp
+                # dominated weighted_score completely and the shortlist
+                # converged to whatever sigma sits at the TOP of
+                # BARRIER_SIGMAS (wp closest to 0.90) -- confirmed live in
+                # two separate logs: narrowing BARRIER_SIGMAS from 0.30-2.00
+                # to 0.85-1.35 didn't change the failure mode at all, it just
+                # relocated the same convergence point to the new grid's
+                # ceiling (sigma 1.25-1.35 both times), and real net payout
+                # there was still $0.01-0.03 with edge_frac as bad as -0.24 --
+                # the untested lower 2/3 of the grid (sigma 0.85-1.20, the
+                # actual user-calibrated target zone) was NEVER once reaching
+                # live EV ranking.
+                #
+                # Fix: slope the penalty across the WHOLE achievable range
+                # (MC_REQUIRED_WIN=0.50 .. MC_MAX_WIN_PROB=0.90) instead of a
+                # knee near the range's edge, so lower-wp/tighter-barrier
+                # candidates get a genuine chance to outrank the wp-maximal
+                # ones in the shortlist.
+                payout_penalty = 1.0 - 2.25 * (wp - 0.50)
+                payout_penalty = max(payout_penalty, 0.05)
+                implied_payout_mult = 1.0 / max(wp, 1e-6)   # logging/Bayes only
 
                 candidates.append({
                     "duration_secs":   dur_secs,
@@ -1766,6 +1777,45 @@ async def fetch_proposal_payout(client: DerivClient, symbol: str,
 # =============================================================================
 # EV-BASED CANDIDATE SELECTION  — replaces win-rate/weighted_score selection
 # =============================================================================
+def stratified_shortlist(candidates: List[dict], n_bins: int = 4, per_bin: int = 3) -> List[dict]:
+    """
+    v7: replaces flat `candidates[:12]`. weighted_score is only a PROXY (see
+    its own comment block) and empirically converges to whichever end of
+    BARRIER_SIGMAS has the highest win_prob, regardless of where that grid's
+    bounds actually sit -- confirmed live across two separate sessions: after
+    BARRIER_SIGMAS was narrowed from 0.30-2.00 to 0.85-1.35 specifically to
+    stop this, the shortlist converged to sigma 1.25-1.35 (the new grid's
+    ceiling) instead, and the actual user-calibrated target zone
+    (sigma 0.85-1.20) was NEVER once reaching live EV ranking in either log.
+    A smarter weighted_score alone isn't a robust enough fix for this --
+    guaranteeing coverage of the full sigma range on every cycle is. Bins
+    barrier_sigma into `n_bins` equal-width buckets spanning the full
+    BARRIER_SIGMAS range and takes the top `per_bin` (by weighted_score)
+    from EACH bucket, so the tightest and widest barriers both always get a
+    live proposal check, not just whichever end weighted_score favours this
+    cycle. Falls back to plain top-N if candidates don't span enough of the
+    range to bin meaningfully.
+    """
+    if not candidates:
+        return []
+    lo, hi = min(BARRIER_SIGMAS), max(BARRIER_SIGMAS)
+    if hi <= lo:
+        return sorted(candidates, key=lambda x: -x["weighted_score"])[:n_bins * per_bin]
+
+    bin_width = (hi - lo) / n_bins
+    bins: List[List[dict]] = [[] for _ in range(n_bins)]
+    for c in candidates:
+        idx = int((c["barrier_sigma"] - lo) / bin_width)
+        idx = min(max(idx, 0), n_bins - 1)
+        bins[idx].append(c)
+
+    shortlist = []
+    for b in bins:
+        b.sort(key=lambda x: -x["weighted_score"])
+        shortlist.extend(b[:per_bin])
+    return shortlist
+
+
 async def rank_candidates_by_ev(client: DerivClient, state: BotState,
                                 symbol: str, candidates: List[dict]
                                 ) -> List[Tuple[dict, float, float, float, float]]:
@@ -2650,7 +2700,11 @@ async def main():
             # v3: wider shortlist (was 6) -- the widened sweep grid produces
             # a much larger candidate pool, so more get a live proposal
             # check before falling back to "nothing this cycle".
-            shortlist = candidates[:12]
+            # v7: stratified across the sigma range (was flat candidates[:12]
+            # by weighted_score) -- see stratified_shortlist() docstring for
+            # why the flat version was silently starving out the tightest
+            # barriers every single cycle.
+            shortlist = stratified_shortlist(candidates, n_bins=4, per_bin=3)
             ranked = await rank_candidates_by_ev(client, state, sym, shortlist)
 
             if not ranked:
