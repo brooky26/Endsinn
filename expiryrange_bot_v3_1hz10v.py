@@ -177,7 +177,7 @@ GARCH_SCALE       = 1000.0   # scale factor for GARCH fitting on relative return
 
 # ── Martingale staking (per-symbol, independent streak tracking) ──────────
 MG_ENABLED        = True
-MG_TRIGGER_LOSSES = 1      # only escalate after this many CONSECUTIVE losses
+MG_TRIGGER_LOSSES = 2      # only escalate after this many CONSECUTIVE losses
 MG_MAX_STEPS      = 3      # cap — step 4 onward stays at step-3 stake
 MG_FACTOR         = 1.18
 MG_MAX_STAKE      = BASE_STAKE * (MG_FACTOR ** MG_MAX_STEPS) * 1.05  # hard ceiling
@@ -210,7 +210,7 @@ STAKE_MULT_MAX    = 1.75   # cap on edge-driven upsizing (separate from and
                             # multiplicative with martingale recovery scaling)
 
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 1      # consecutive passes the top candidate must survive
+CONFIRM_REQUIRED      = 2      # consecutive passes the top candidate must survive
 CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
@@ -310,29 +310,34 @@ DIR_OVERLAY_MIN_PAYOUT = 0.05              # lower payout floor for CALL/PUT
 SYMBOL_CONFIG = {
     "1HZ10V": {
         "ticks_per_sec":     1.0,
-        "max_adx":           10,    # v5 (2026-07-28 log): was 8, but that's not what
-                                     # the old comment even claimed (it said "9" was
-                                     # the calibrated value -- 8 shipped by mistake).
-                                     # Real log data over a 4-min live window showed
-                                     # ADX=8.0-9.6, mean 8.7, i.e. current conditions
-                                     # sit AT the old threshold -- it was blocking
-                                     # ~80% of all cycles (66/83 blocked gate checks
-                                     # cited fail_adx alone). Set to 10, comfortably
-                                     # above the observed 9.6 max, so it filters
-                                     # genuine trend spikes again instead of blocking
-                                     # ordinary conditions. Re-check against a longer
-                                     # log once this has run a full session -- 4
-                                     # minutes of data is enough to see the threshold
-                                     # was clearly miscalibrated, not enough to
-                                     # perfectly recalibrate it.
+        "max_adx":           13,    # v11 (2026-07-30, 1h48m/2002-gate-check log):
+                                     # was 10. That earlier fix was based on only 4
+                                     # minutes of data and said as much ("enough to
+                                     # see it was miscalibrated, not enough to
+                                     # perfectly recalibrate"). This log showed real
+                                     # ADX up to 14.0 (mean 10.9 among blocks) --
+                                     # raising to 13 lets ~94% of previously-blocked
+                                     # fail_adx cases through while still catching
+                                     # genuinely extreme readings above what's been
+                                     # observed.
         "min_vol_trust":     0.85,
-        "max_mbs":           0.50,  # v5: was 0.40; observed failing values were
-                                     # 0.45-0.49, same "threshold sits inside the
-                                     # normal range" symptom as max_adx above.
-        "boll_width_factor": 1.20,  # NOT changed -- observed fail_boll values
-                                     # (cur_std/med_std up to 2.15) look like genuine
-                                     # volatility expansion, not miscalibration; this
-                                     # gate was doing its job in the log.
+        "max_mbs":           0.60,  # v11: was 0.50. Observed failing values 0.50-0.62
+                                     # (mean 0.54) -- same "threshold sits inside the
+                                     # normal range" symptom, not a rare-tail one.
+                                     # 0.60 lets ~97% of previously-blocked cases through.
+        "boll_width_factor": 1.80,  # v11: was 1.20 -- this turned out to be the
+                                     # DOMINANT blocker in the 2026-07-30 log (1923/2002
+                                     # blocked gate checks, 96%), not a rare-spike
+                                     # filter as the v5 comment assumed. Real
+                                     # cur_std/med_std for 1HZ10V ranged 1.20-4.49
+                                     # (median 1.52, 5th percentile only 1.221) --
+                                     # i.e. "current vol > 1.2x medium-term median"
+                                     # is closer to this instrument's NORMAL state
+                                     # than an exceptional one. 1.80 lets ~76% of
+                                     # previously-blocked cases through while still
+                                     # blocking the top quartile of genuine spikes
+                                     # (up to 4.49x). Re-check against a longer log --
+                                     # same caveat as the max_adx note above.
         "max_hawkes":        0.50,
         "cooldown_secs":     150,
         "barrier_dp":        2,    # Deriv: max 2 decimal places for 1HZ10V barriers
@@ -2591,6 +2596,13 @@ def load_config_from_supabase(state: BotState, store: SupabaseStore):
             if s in dur_w:
                 state.duration_weights[s] = {int(k): float(v) for k, v in dur_w[s].items()}
                 loaded = True
+        stale = set(dur_w.keys()) - set(SYMBOLS)
+        if stale:
+            print(f"[Config] WARNING: duration_weights in Supabase has "
+                  f"key(s) {sorted(stale)} that don't match current "
+                  f"SYMBOLS={SYMBOLS} -- that data will never be used. "
+                  f"If this looks like a mangled symbol name, check SYMBOLS "
+                  f"for a typo (see the startup validation in main()).")
     bar_w = store.load_config("barrier_weights")
     if bar_w:
         for s in SYMBOLS:
@@ -2645,6 +2657,31 @@ async def main():
         sys.exit("[FATAL] DERIV_API_TOKEN not set.")
     if not DERIV_APP_ID:
         sys.exit("[FATAL] DERIV_APP_ID not set.")
+
+    # v10: fail fast if SYMBOLS contains anything without a matching
+    # SYMBOL_CONFIG entry. Root-caused a real incident: a missing comma
+    # between two adjacent string literals in a SYMBOLS edit (e.g.
+    # ["1HZ10V" "R_10"]) is valid Python -- it silently concatenates into
+    # ONE bogus symbol string ("1HZ10VR_10") instead of raising a syntax
+    # error. That bogus "symbol" then gets written into every self-
+    # improvement config table (duration_weights/barrier_weights/
+    # vol_scalars) under a key the live bot can never look back up
+    # (state.duration_weights.get("1HZ10V", ...) never finds
+    # "1HZ10VR_10") -- silently discarding all learned duration/barrier
+    # preference on every restart -- and Deriv likely rejects tick
+    # subscriptions for a symbol name that doesn't exist, which is
+    # consistent with a real multi-hour trade-frequency dead zone that
+    # traced back to exactly this. Better to refuse to start than to
+    # silently corrupt config and starve trading for hours before anyone
+    # notices.
+    for _s in SYMBOLS:
+        if _s not in SYMBOL_CONFIG:
+            sys.exit(f"[FATAL] SYMBOLS contains '{_s}' which has no "
+                     f"SYMBOL_CONFIG entry. Check for a typo -- a missing "
+                     f"comma between two adjacent string literals silently "
+                     f"concatenates them (e.g. [\"1HZ10V\" \"R_10\"] becomes "
+                     f"[\"1HZ10VR_10\"], not two symbols). Configured "
+                     f"symbols: {list(SYMBOL_CONFIG.keys())}")
 
     store = SupabaseStore()
     state = BotState()
