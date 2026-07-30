@@ -110,6 +110,7 @@ v3 CHANGES (2026-07-27) — fixes candidate scarcity, adds HMM/GBM engine:
 """
 
 import asyncio, contextlib, io, json, math, os, random, sys, time, warnings
+import base64
 from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
@@ -119,6 +120,19 @@ import requests
 import websockets
 from scipy.stats import norm
 from arch import arch_model
+
+# v9: LSTM barrier/duration win-probability classifier (see
+# expiryrange_lstm_model.py). Imported defensively -- if torch isn't
+# installed or the import otherwise fails, the bot falls back to the
+# bootstrap+HMM/GBM blend only (pre-v8 behaviour), rather than crashing on
+# startup over an optional component.
+try:
+    import torch
+    from expiryrange_lstm_model import BarrierWinClassifier
+    _LSTM_AVAILABLE = True
+except Exception as _lstm_import_err:
+    _LSTM_AVAILABLE = False
+    print(f"[LSTM] torch/model import failed, LSTM component disabled: {_lstm_import_err}")
 
 warnings.filterwarnings("ignore")
 
@@ -137,7 +151,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
 # ── Symbols ───────────────────────────────────────────────────────────────
 # v3: restricted to 1HZ10V only (RDBEAR dropped) -- see header notes.
-SYMBOLS = ["1HZ10V" "R_10"]
+SYMBOLS = ["1HZ10V"]
 
 # ── Contract parameters ───────────────────────────────────────────────────
 BASE_STAKE        = 0.35     # Deriv minimum (was mistakenly 1.0 -- see v3 notes
@@ -163,7 +177,7 @@ GARCH_SCALE       = 1000.0   # scale factor for GARCH fitting on relative return
 
 # ── Martingale staking (per-symbol, independent streak tracking) ──────────
 MG_ENABLED        = True
-MG_TRIGGER_LOSSES = 1      # only escalate after this many CONSECUTIVE losses
+MG_TRIGGER_LOSSES = 2      # only escalate after this many CONSECUTIVE losses
 MG_MAX_STEPS      = 3      # cap — step 4 onward stays at step-3 stake
 MG_FACTOR         = 1.18
 MG_MAX_STAKE      = BASE_STAKE * (MG_FACTOR ** MG_MAX_STEPS) * 1.05  # hard ceiling
@@ -196,7 +210,7 @@ STAKE_MULT_MAX    = 1.75   # cap on edge-driven upsizing (separate from and
                             # multiplicative with martingale recovery scaling)
 
 # ── Signal confirmation (reduces trade frequency / false positives) ───────
-CONFIRM_REQUIRED      = 1      # consecutive passes the top candidate must survive
+CONFIRM_REQUIRED      = 2      # consecutive passes the top candidate must survive
 CONFIRM_MIN_GAP_SECS  = 60     # minimum time between confirmation checks
 CONFIRM_MAX_AGE_SECS  = 600    # abandon a confirmation streak if it's been open
                                 # this long without completing (stale signal)
@@ -215,8 +229,8 @@ MC_CI_PERCENTILE = 5
 # obviously a coin flip (win_prob too low) or obviously unpriceable
 # ("no return" territory, win_prob too high). See MC_FAIR_ODDS_CEIL below
 # for where the old tight ceiling came from.
-MC_REQUIRED_WIN  = 0.57
-MC_REQUIRED_CI   = 0.50
+MC_REQUIRED_WIN  = 0.50
+MC_REQUIRED_CI   = 0.46
 MC_FAIR_ODDS_CEIL = BASE_STAKE / (BASE_STAKE + MIN_NET_PAYOUT)   # ~ 0.658 --
                                                  # kept only as a reference
                                                  # point / log annotation now.
@@ -522,6 +536,22 @@ class SupabaseStore:
             return json.loads(raw) if isinstance(raw, str) else raw
         return None
 
+    def load_lstm_model(self):
+        """v8: fetches the latest trained LSTM state_dict, written by the
+        separate expiryrange_lstm_train.py cron service. Returns
+        (state_dict_b64, trained_at) or (None, None) if no model has been
+        trained yet or the request fails -- callers must treat this as
+        optional and fall back gracefully (see load_or_refresh_lstm())."""
+        try:
+            rows = self._select(
+                "bot_expiryrange_lstm_model",
+                "select=state_dict_b64,trained_at,val_loss&key=eq.current")
+            if rows:
+                return rows[0]["state_dict_b64"], rows[0]["trained_at"]
+        except Exception as e:
+            print(f"[LSTM] Supabase fetch failed: {e}")
+        return None, None
+
     def save_daily_summary(self, date_str, symbol, n, wins, profit, best_dur, best_bar):
         self._upsert("bot_expiryrange_daily", {
             "date_utc":     date_str, "symbol": symbol,
@@ -747,6 +777,12 @@ class BotState:
         self.last_daily_tune  = 0.0
         self.garch_cache: Dict[str, tuple]  = {}     # sym -> (result, fitted_at)
         self.vol_scalar: Dict[str, float]   = {s: 1.0 for s in SYMBOLS}
+        # v8: LSTM terminal-price model, hot-reloaded from Supabase -- see
+        # load_or_refresh_lstm(). None until the first successful load; the
+        # optimizer falls back to bootstrap+HMM/GBM only until then.
+        self.lstm_model             = None
+        self.lstm_trained_at: Optional[str] = None
+        self.lstm_last_check_time   = 0.0
         # Cold-start priors from the first 81-trade sample (pre-self-improvement):
         # 120s = 70.6% win/+0.96 net, 300s = 68.2% win/+0.70 net -> favoured.
         # 180s/360s/480s were net-negative -> down-weighted until real data overrides.
@@ -1394,6 +1430,69 @@ def hmm_gbm_terminal_samples(hmm: SimpleHMM2, price_now: float,
     return price_now * np.exp(log_ret_total) - price_now
 
 
+# =============================================================================
+# LSTM TERMINAL-PRICE MODEL (v8)
+# =============================================================================
+# Trained OFFLINE by the separate expiryrange_lstm_train.py service (a
+# Railway cron job, twice daily). This module only does INFERENCE + hot-
+# reload -- no training happens in the live process. See
+# expiryrange_lstm_model.py for the architecture/prediction target
+# (per-tick Gaussian (mu, sigma), NOT a specific future price -- see that
+# file's docstring for why).
+LSTM_RELOAD_CHECK_INTERVAL_SECS = 1800   # poll Supabase for a newer model
+                                          # at most every 30 min -- cheap
+                                          # metadata-only query either way
+
+
+def load_or_refresh_lstm(state: "BotState", store: Optional["SupabaseStore"]):
+    """
+    Called once per main-loop cycle; internally throttled. If torch/the
+    model class failed to import at startup, this is a permanent no-op
+    (state.lstm_model stays None forever, optimizer uses bootstrap+HMM/GBM
+    only). If Supabase has a model newer than what's cached, loads it.
+    Any failure here (bad state_dict, network error, no model trained yet)
+    leaves the PREVIOUSLY cached model in place (or None) -- never crashes
+    the trading loop over an optional component.
+    """
+    if not _LSTM_AVAILABLE or store is None:
+        return
+    now = time.time()
+    if now - state.lstm_last_check_time < LSTM_RELOAD_CHECK_INTERVAL_SECS:
+        return
+    state.lstm_last_check_time = now
+
+    b64, trained_at = store.load_lstm_model()
+    if b64 is None:
+        if state.lstm_model is None:
+            print("[LSTM] No trained model in Supabase yet -- "
+                  "using bootstrap+HMM/GBM only until the trainer's first run completes.")
+        return
+    if trained_at == state.lstm_trained_at:
+        return   # already have this exact version loaded
+
+    try:
+        raw = base64.b64decode(b64)
+        state_dict = torch.load(io.BytesIO(raw), map_location="cpu")
+        model = BarrierWinClassifier()
+        model.load_state_dict(state_dict)
+        model.eval()
+        was_first_load = state.lstm_model is None
+        state.lstm_model = model
+        state.lstm_trained_at = trained_at
+        print(f"[LSTM] Loaded model trained_at={trained_at} "
+              f"({'first load' if was_first_load else 'reload'})")
+    except Exception as e:
+        print(f"[LSTM] Failed to load model (trained_at={trained_at}): {e} -- "
+              f"keeping previous model (or none) in place.")
+
+
+# v9: LSTM_BLEND_WEIGHT controls how much the classifier's win_prob counts
+# against the MC engine's (bootstrap+HMM/GBM) estimate for the SAME
+# (duration, barrier_sigma) -- 0.5 = equal weight. Only applied when a
+# model is loaded; MC-only otherwise (see mc_auto_optimize()).
+LSTM_BLEND_WEIGHT = 0.5
+
+
 def win_prob_from_samples(terminal: np.ndarray, upper_abs: float,
                           lower_abs: float) -> dict:
     """Cheap vectorized barrier check against pre-drawn terminal samples."""
@@ -1526,6 +1625,21 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
               f"({len(hmm_input)} ticks, need >= {MIN_TICKS_FOR_HMM}) "
               f"-- GBM component uses flat fallback this cycle")
 
+    # ── LSTM classifier hidden state (v9) — computed ONCE per cycle here,
+    # reused for every (duration, barrier_sigma) combo in the sweep below
+    # via predict_win_probs_batch(). The encoder doesn't depend on
+    # duration/barrier at all, only the window -- see
+    # expiryrange_lstm_model.py's "EFFICIENCY NOTE".
+    lstm_model = state.lstm_model
+    lstm_hidden = None
+    if lstm_model is not None:
+        try:
+            lstm_hidden = lstm_model.compute_hidden(returns)
+        except Exception as e:
+            print(f"[LSTM] compute_hidden failed, disabling classifier "
+                  f"blend this cycle: {e}")
+            lstm_hidden = None
+
     # ── Directional bias & drift ──────────────────────────────────────────
     bias         = compute_directional_bias(prices, abs_vol)   # [-1, +1] capped
     # Convert bias to a per-tick drift in absolute price units.
@@ -1583,6 +1697,14 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
         # regime-conditional HMM/GBM sampler (lognormal, regime-persistent
         # drift/vol). This makes the HMM/GBM model a direct input to which
         # duration/barrier gets selected, not just a side diagnostic.
+        #
+        # v9: the LSTM no longer contributes SAMPLES to this blend (that
+        # was v8's design -- a generic next-tick forecast extrapolated via
+        # the same sqrt(duration) formula GARCH/HMM already use). It's now
+        # a direct (duration, barrier_sigma) win-probability classifier
+        # instead, blended at the PROBABILITY level per sigma below (see
+        # classifier_wps), not the sample level -- so this stays a clean
+        # two-way sample blend regardless of whether an LSTM is loaded.
         n_boot = MC_SIMULATIONS // 2
         n_gbm  = MC_SIMULATIONS - n_boot
         gen = generate_terminal_samples(
@@ -1597,7 +1719,20 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
         terminal       = np.concatenate([gen["terminal"], gbm_terminal])
         used_bootstrap = gen["used_bootstrap"]
 
-        for bs in sigma_grid:
+        # v9: one batched classifier call per duration covers every sigma
+        # in the grid -- cheap, since the encoder (the expensive part) was
+        # already run once for the whole cycle (lstm_hidden, above).
+        classifier_wps = None
+        if lstm_hidden is not None:
+            try:
+                classifier_wps = lstm_model.predict_win_probs_batch(
+                    lstm_hidden, [(n_steps, bs) for bs in sigma_grid])
+            except Exception as e:
+                print(f"[LSTM] predict_win_probs_batch failed for dur={dur_secs}s, "
+                      f"MC-only this duration: {e}")
+                classifier_wps = None
+
+        for bs_idx, bs in enumerate(sigma_grid):
             barrier_abs = max(bs * vol_terminal, BARRIER_ABS_MIN)
 
             for ur, lr, _ in asym_pairs:
@@ -1617,7 +1752,18 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
 
                 mc = win_prob_from_samples(terminal, upper_abs, lower_abs)
 
-                wp  = mc["win_prob"]
+                wp = mc["win_prob"]
+                # v9: blend in the classifier's win_prob for this (duration,
+                # barrier_sigma) if available. Note the classifier was
+                # trained against a SYMMETRIC barrier_abs (see
+                # expiryrange_lstm_model.py / the trainer's label
+                # construction) -- for asymmetric candidates this is an
+                # approximation (the classifier corrects the overall width
+                # calibration; win_prob_from_samples still does the exact
+                # asymmetric evaluation via real MC samples either way).
+                if classifier_wps is not None:
+                    wp = (LSTM_BLEND_WEIGHT * float(classifier_wps[bs_idx])
+                          + (1 - LSTM_BLEND_WEIGHT) * wp)
                 cil = ci_lower_bound(wp, MC_SIMULATIONS)
 
                 # Calibration-aware floor: if daily_self_improvement has had to
@@ -1686,7 +1832,7 @@ def mc_auto_optimize(prices: np.ndarray, price_diffs: np.ndarray,
                     "n_steps":         n_steps,
                     "win_prob":        wp,
                     "ci_lower":        cil,
-                    "breach_prob":     mc["breach_prob"],
+                    "breach_prob":     1.0 - wp,
                     "vol_per_tick":    abs_vol,
                     "vol_terminal":    vol_terminal,
                     "used_garch":      used_garch,
@@ -2503,6 +2649,8 @@ async def main():
     store = SupabaseStore()
     state = BotState()
     load_config_from_supabase(state, store)
+    load_or_refresh_lstm(state, store)   # v8: initial attempt; retried each
+                                          # main-loop cycle (throttled) below
 
     client  = DerivClient(DERIV_APP_ID, DERIV_API_TOKEN,
                           DERIV_ACCOUNT_TYPE, DERIV_ACCOUNT_ID)
@@ -2573,6 +2721,8 @@ async def main():
     # MAIN LOOP
     # =========================================================================
     while True:
+        load_or_refresh_lstm(state, store)   # v8: throttled internally, cheap to call every cycle
+
         # Drain tick queues
         for sym in SYMBOLS:
             drained = 0
