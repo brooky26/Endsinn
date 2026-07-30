@@ -47,8 +47,10 @@ import io
 import json
 import math
 import os
+import resource
 import sys
 import time
+import traceback
 from typing import Optional
 
 import numpy as np
@@ -103,6 +105,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 API_BASE   = "https://api.derivws.com/trading/v1/options"
 ACCOUNTS_PATH = "/accounts"
 OTP_PATH      = "/accounts/{account_id}/otp"
+
+
+def log_peak_mem(tag: str):
+    """Prints peak RSS so far. Cheap (stdlib only, no psutil dependency) and
+    lets us see in the logs exactly how close to the container's memory
+    ceiling we got, and at which stage -- if the process gets OOM-killed,
+    the last of these lines printed tells us where it died, since a kill
+    from outside the process leaves no traceback of its own."""
+    peak_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"[Trainer] [mem] {tag}: peak RSS so far = {peak_mb:.0f} MB")
 
 
 # =============================================================================
@@ -263,13 +275,38 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
     lo_dur, hi_dur = DURATION_TICKS_RANGE
     lo_sig, hi_sig = BARRIER_SIGMA_RANGE
 
-    windows, ds_pairs, labels = [], [], []
     anchor_start = window_size
     anchor_end = n - max_dur - 1   # need max_dur future returns available
     if anchor_end <= anchor_start:
-        return (np.empty((0, window_size)), np.empty((0, 2)), np.empty((0,)))
+        return (np.empty((0, window_size), dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
 
-    for t in range(anchor_start, anchor_end, ANCHOR_STRIDE):
+    anchor_ts = range(anchor_start, anchor_end, ANCHOR_STRIDE)
+    n_anchors = len(anchor_ts)
+    max_n = n_anchors * COMBOS_PER_ANCHOR   # worst case, some anchors/combos get skipped
+
+    # Preallocate once, in float32, instead of Python-list-append + a later
+    # np.array() copy -- that old pattern briefly holds BOTH the list and
+    # its array copy in memory at once (roughly double peak RSS right at
+    # this step), with zero logging in between, which is exactly the kind
+    # of silent OOM-and-die spot we want to avoid.
+    windows = np.empty((max_n, window_size), dtype=np.float32)
+    ds_pairs = np.empty((max_n, 2), dtype=np.float32)
+    labels = np.empty((max_n,), dtype=np.float32)
+
+    print(f"[Trainer] Building labeled examples: {n_anchors} anchors x "
+          f"{COMBOS_PER_ANCHOR} combos (up to {max_n} examples)...")
+    log_peak_mem("before building labeled examples")
+
+    idx = 0
+    progress_every = max(1, n_anchors // 5)   # ~5 progress lines total
+    for i, t in enumerate(anchor_ts):
+        if i > 0 and i % progress_every == 0:
+            print(f"[Trainer]   ...{i}/{n_anchors} anchors processed "
+                  f"({idx} examples so far)")
+            log_peak_mem(f"anchor {i}/{n_anchors}")
+
         window = returns[t - window_size:t]
         local_vol_per_tick = float(np.std(window)) * float(prices[t])
         if local_vol_per_tick <= 0:
@@ -290,13 +327,23 @@ def build_labeled_examples(prices: np.ndarray, returns: np.ndarray,
             displacement = terminal_price - entry_price
             label = 1.0 if (-barrier_abs < displacement < barrier_abs) else 0.0
 
-            windows.append(window)
-            ds_pairs.append((normalize_duration(n_steps), barrier_sigma))
-            labels.append(label)
+            windows[idx] = window
+            ds_pairs[idx, 0] = normalize_duration(n_steps)
+            ds_pairs[idx, 1] = barrier_sigma
+            labels[idx] = label
+            idx += 1
 
-    if not windows:
-        return (np.empty((0, window_size)), np.empty((0, 2)), np.empty((0,)))
-    return np.array(windows), np.array(ds_pairs), np.array(labels)
+    print(f"[Trainer] Built {idx} labeled examples.")
+    log_peak_mem("after building labeled examples")
+
+    if idx == 0:
+        return (np.empty((0, window_size), dtype=np.float32),
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=np.float32))
+    # Trim the unused tail (skipped anchors/combos left preallocated rows
+    # unwritten) -- this is a view/copy of just the used rows, not a
+    # second full-size allocation.
+    return windows[:idx], ds_pairs[:idx], labels[:idx]
 
 
 # =============================================================================
@@ -353,6 +400,7 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     X_train, DS_train, y_train = X[:-n_val], DS[:-n_val], y[:-n_val]
     X_val, DS_val, y_val       = X[-n_val:], DS[-n_val:], y[-n_val:]
 
+    log_peak_mem("before building torch tensors")
     train_ds = TensorDataset(
         torch.tensor(X_train, dtype=torch.float32).unsqueeze(-1),
         torch.tensor(DS_train, dtype=torch.float32),
@@ -371,6 +419,7 @@ def train_model(prices: np.ndarray, returns: np.ndarray) -> tuple:
     best_val_acc = 0.0
     best_state = None
 
+    log_peak_mem("before first epoch")
     for epoch in range(1, EPOCHS + 1):
         model.train()
         train_losses = []
@@ -442,4 +491,16 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception:
+        # asyncio.run() would print this to stderr anyway on an unhandled
+        # exception, but making it explicit here means it's guaranteed to
+        # show up as one clearly-labeled block in the logs, and we get a
+        # final memory reading either way -- useful to distinguish "the code
+        # threw" (traceback below) from "the container got killed"
+        # (this line never gets a chance to run at all).
+        print("[Trainer] FATAL -- training run failed with an exception:")
+        traceback.print_exc()
+        log_peak_mem("at failure")
+        sys.exit(1)
