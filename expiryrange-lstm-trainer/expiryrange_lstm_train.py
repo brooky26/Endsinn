@@ -100,7 +100,7 @@ DERIV_ACCOUNT_ID   = os.getenv("DERIV_ACCOUNT_ID") or None
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
 
-API_BASE   = "https://api.deriv.com"
+API_BASE   = "https://api.derivws.com/trading/v1/options"
 ACCOUNTS_PATH = "/accounts"
 OTP_PATH      = "/accounts/{account_id}/otp"
 
