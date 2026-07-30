@@ -177,9 +177,9 @@ GARCH_SCALE       = 1000.0   # scale factor for GARCH fitting on relative return
 
 # ── Martingale staking (per-symbol, independent streak tracking) ──────────
 MG_ENABLED        = True
-MG_TRIGGER_LOSSES = 2      # only escalate after this many CONSECUTIVE losses
+MG_TRIGGER_LOSSES = 1      # only escalate after this many CONSECUTIVE losses
 MG_MAX_STEPS      = 3      # cap — step 4 onward stays at step-3 stake
-MG_FACTOR         = 1.18
+MG_FACTOR         = 1.22
 MG_MAX_STAKE      = BASE_STAKE * (MG_FACTOR ** MG_MAX_STEPS) * 1.05  # hard ceiling
                                                                        # (safety margin
                                                                        # for rounding)
@@ -229,8 +229,8 @@ MC_CI_PERCENTILE = 5
 # obviously a coin flip (win_prob too low) or obviously unpriceable
 # ("no return" territory, win_prob too high). See MC_FAIR_ODDS_CEIL below
 # for where the old tight ceiling came from.
-MC_REQUIRED_WIN  = 0.50
-MC_REQUIRED_CI   = 0.46
+MC_REQUIRED_WIN  = 0.42
+MC_REQUIRED_CI   = 0.36
 MC_FAIR_ODDS_CEIL = BASE_STAKE / (BASE_STAKE + MIN_NET_PAYOUT)   # ~ 0.658 --
                                                  # kept only as a reference
                                                  # point / log annotation now.
